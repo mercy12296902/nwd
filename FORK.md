@@ -36,12 +36,17 @@ its geometry record (`ModelGraphReader`). A wrong skip fails these checks instea
 
 A small command line tool on top of the library:
 
-- `nwdtool inventory <in.nwd> <out_dir>` writes `inventory.json`: length unit, model files, levels (with the median top of their
-  floors in metres), categories, and the 40 heaviest families per category, each with mesh and triangle counts and a bounding box in metres.
+- Labels come from the node's ancestors. Which ancestor is the model file, level, category and family depends on the exporter
+  (Revit: file > level > category > family > type > element, i.e. 1/2/3/4). Nothing is assumed: a `depth` map declares it
+  (Revit layout by default), and rules can also match the whole ancestor `path`.
+- `nwdtool inventory <in.nwd> <out_dir> [depth]` writes `inventory.json`: length unit, sample ancestor paths per model file (to check
+  `depth`), model files, levels, categories and the 40 heaviest families per category, each with mesh and triangle counts and a bounding
+  box in metres. Per level it gives `floor_top_m`, the mode of the top elevation of flat, large meshes (height < 0.5 m, area > 1 m2),
+  which does not depend on category names or language, and `base_z_mode_m`, the mode of all mesh bottoms (often the slab soffit).
 - `nwdtool export <in.nwd> <keep.json> <out_dir>` keeps the meshes selected by `keep` / `drop` rules (regular expressions on model file,
-  level, category and family), converts to metres, shifts to an origin and a ground level, groups meshes by model file, level, category
-  and material, and writes raw float32 vertices / uint32 indices per group with a `groups.json` manifest. Rules under `lights` export only
-  the positions of those elements (for example lighting fixtures) to `lights.json`.
+  level, category, family or path), converts to metres, shifts to an origin and a ground level, groups meshes by module, model file,
+  level, category and material, and writes raw float32 vertices / uint32 indices per group with a `groups.json` manifest. Rules under
+  `lights` export only the positions of those elements to `lights.json`; rules under `ground` put kept meshes in the Ground module.
 
 See the header of `tools/nwdtool/Program.cs` for the `keep.json` format.
 
