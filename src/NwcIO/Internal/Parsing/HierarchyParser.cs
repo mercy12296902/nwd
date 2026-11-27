@@ -54,9 +54,59 @@ internal static class HierarchyParser
         int maxExpandedPropertyReferences = DefaultMaxExpandedPropertyReferences)
     {
         guids ??= [];
-        var (top, total) = new Parser(new LcObjectReader(data, Segment), guids.Count, partitionProps ?? (() => null),
-            maxExpandedPropertyReferences).ReadStream();
-        return Expand(top, rootName, total, includeProperties, guids);
+
+        // Unknown objects in a partition trailer are skipped to a resync point (ReadPartitionTrailer). A wrong resync point makes a later
+        // read fail; then the last skip takes its next candidate and the stream is read again. Nothing is guessed silently: if every
+        // candidate fails, the original error is thrown, and the fragments check (ModelGraphReader) still validates every leaf it maps.
+        // partitionProps may be called once per parse, so its result is cached across attempts.
+        IReadOnlyList<byte[]>? cachedProps = null;
+        bool propsRead = false;
+        Func<IReadOnlyList<byte[]>?> props = () =>
+        {
+            if (!propsRead) { cachedProps = (partitionProps ?? (() => null))(); propsRead = true; }
+            return cachedProps;
+        };
+        var choices = new List<int>();
+        InvalidDataException? first = null;
+        for (int attempt = 0; attempt < 64; attempt++)
+        {
+            var parser = new Parser(new LcObjectReader(data, Segment), guids.Count, props, maxExpandedPropertyReferences, choices);
+            try
+            {
+                var (top, total) = parser.ReadStream();
+                foreach (var line in parser.SkipLog)
+                {
+                    Console.Error.WriteLine(line);
+                }
+
+                return Expand(top, rootName, total, includeProperties, guids);
+            }
+            catch (InvalidDataException ex) when (parser.SkipCandidates.Count > 0)
+            {
+                first ??= ex;
+                // Advance the deepest skip that still has candidates; drop the choices after it.
+                int k = parser.SkipCandidates.Count - 1;
+                while (k >= 0 && (k < choices.Count ? choices[k] : 0) + 1 >= parser.SkipCandidates[k])
+                {
+                    k--;
+                }
+
+                if (k < 0)
+                {
+                    throw new InvalidDataException($"{first.Message} (after trying every resync point of {parser.SkipCandidates.Count} skipped trailer(s))", first);
+                }
+
+                while (choices.Count <= k)
+                {
+                    choices.Add(0);
+                }
+
+                choices[k]++;
+                choices.RemoveRange(k + 1, choices.Count - k - 1);
+            }
+        }
+
+        throw first ?? new InvalidDataException($"{Segment}: too many resync attempts");
     }
 
     /// <summary>Reads a class-185 body (material JSON with embedded files, docs/format-notes.md §2.2), which the fragments stream holds too.</summary>
@@ -250,9 +300,15 @@ internal static class HierarchyParser
         // The roots the null attribute slots take; ReadStream sets it from the header.
         private PartitionRoots? _roots;
 
+        // Skips taken in this parse: number of resync candidates at each, and a readable log.
+        public readonly List<int> SkipCandidates = [];
+        public readonly List<string> SkipLog = [];
+        private readonly IReadOnlyList<int> _choices;
+
         public Parser(LcObjectReader reader, int guidCount, Func<IReadOnlyList<byte[]>?>? partitionProps,
-            int maxExpandedPropertyReferences = DefaultMaxExpandedPropertyReferences)
+            int maxExpandedPropertyReferences = DefaultMaxExpandedPropertyReferences, IReadOnlyList<int>? choices = null)
         {
+            _choices = choices ?? [];
             _reader = reader;
             _guidCount = guidCount;
             _maxExpandedPropertyReferences = maxExpandedPropertyReferences;
@@ -392,7 +448,17 @@ internal static class HierarchyParser
                 throw _reader.Fail("partition trailer does not start with 2");
             }
 
-            _reader.ReadInt32();
+            int count = _reader.ReadInt32();
+
+            // Some files (seen: Revit exports with photometric lights) store `count` new objects here, of classes this reader does not
+            // know (seen: class 27, each with a class-185 light material). Their layout is unknown, so they are skipped to the next
+            // point where the stream can be read again: the next top-level pointer [Next..][32|53], or the hierarchy tail [1] + zero pad.
+            if (count > 0 && _reader.PeekInt32(_reader.Position) == _reader.Next && !KnownClasses.Contains(_reader.PeekInt32(_reader.Position + 4)))
+            {
+                SkipUnknownTrailer(count);
+                return;
+            }
+
             SkipDoubles(3);
             _reader.ReadInt32();
             _reader.ReadString();
@@ -407,6 +473,41 @@ internal static class HierarchyParser
             SkipDoubles(7);
             _reader.ReadInt32();
             _reader.ReadInt32();
+        }
+
+        private void SkipUnknownTrailer(int count)
+        {
+            int start = _reader.Position;
+            int firstClass = _reader.PeekInt32(start + 4);
+            var candidates = new List<(int Position, int NextId)>();
+            for (int p = start + 8; p + 8 <= _reader.Length && candidates.Count < 16; p += 4)
+            {
+                int v = _reader.PeekInt32(p);
+                if (v >= _reader.Next && v < _reader.Next + 1_000_000 && TopLevelClasses.Contains(_reader.PeekInt32(p + 4)))
+                {
+                    candidates.Add((p, v));
+                }
+                else if (v == 1 && _reader.Length - (p + 4) < 8 && _reader.Slice(p + 4, _reader.Length).IndexOfAnyExcept((byte)0) < 0)
+                {
+                    candidates.Add((p, _reader.Next)); // the hierarchy tail: this was the last top-level node
+                }
+            }
+
+            int index = SkipCandidates.Count;
+            SkipCandidates.Add(candidates.Count);
+            int choice = index < _choices.Count ? _choices[index] : 0;
+            if (choice >= candidates.Count)
+            {
+                throw _reader.Fail($"no resync point after {count} unknown trailer object(s) of class {firstClass}");
+            }
+
+            var (to, nextId) = candidates[choice];
+            string text = string.Join(" | ", System.Text.RegularExpressions.Regex.Matches(
+                    System.Text.Encoding.Latin1.GetString(_reader.Slice(start, to)), "[\\x20-\\x7e]{8,}")
+                .Select(m => m.Value.Length > 60 ? m.Value[..60] + "..." : m.Value).Distinct().Take(4));
+            SkipLog.Add($"[skip] {Segment}: bytes {start}..{to} ({to - start} B), {count} trailer object(s) of unknown class {firstClass}, " +
+                $"ids {_reader.Next}..{nextId - 1}, resync {choice + 1}/{candidates.Count}; text: {text}");
+            _reader.SkipTo(to, nextId);
         }
 
         private void SkipDoubles(int count)

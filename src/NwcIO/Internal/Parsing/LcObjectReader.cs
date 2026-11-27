@@ -30,6 +30,36 @@ internal sealed class LcObjectReader
 
     public int Position { get; private set; }
 
+    /// <summary>Body of an object that was skipped as unknown (see <see cref="SkipTo"/>); attribute slots accept it and drop it.</summary>
+    public static readonly object Skipped = new();
+
+    public int Length => _data.Length;
+
+    public int PeekInt32(int at) => at >= 0 && at + 4 <= _data.Length ? BinaryPrimitives.ReadInt32LittleEndian(_data.AsSpan(at, 4)) : int.MinValue;
+
+    public ReadOnlySpan<byte> Slice(int start, int end) => _data.AsSpan(start, end - start);
+
+    /// <summary>
+    /// Moves to <paramref name="position"/> after skipping unknown objects; ids up to <paramref name="nextId"/> - 1 are registered as skipped,
+    /// so later pointers keep their numbering. A back-reference to a skipped id is accepted only where an attribute is expected.
+    /// </summary>
+    public void SkipTo(int position, int nextId)
+    {
+        if (position < Position || position > _data.Length || nextId < Next)
+        {
+            throw Fail($"cannot skip to byte {position} with next id {nextId}");
+        }
+
+        while (Next < nextId)
+        {
+            _objects.Add((SkippedClass, Skipped));
+        }
+
+        Position = position;
+    }
+
+    public const int SkippedClass = -1;
+
     /// <summary>The id the next new object takes; inside a body, the body's own id is <c>Next - 1</c> until it reads a pointer.</summary>
     public int Next => FirstId + _objects.Count;
 
@@ -160,6 +190,17 @@ internal sealed class LcObjectReader
             if (body is null)
             {
                 throw Fail($"back-reference to unfinished object {id}");
+            }
+
+            if (classId == SkippedClass)
+            {
+                // Only attribute-like slots (no node, username or element-id class) may drop a skipped object.
+                if (allowedClasses.Contains(52) || allowedClasses.Contains(22) || allowedClasses.Contains(53) || allowedClasses.Contains(32))
+                {
+                    throw Fail($"back-reference to skipped object {id} in a slot that needs it");
+                }
+
+                return body;
             }
 
             if (!allowedClasses.Contains(classId))
